@@ -435,13 +435,32 @@ h1 {
   margin-top: 1rem;
 }
 
-/* ── Editor Toolbar & Colour Picker ── */
+/* ── Editor Toolbar & Colour Picker (Sticky on Scroll) ── */
+/* Keeps the formatting bar (bullet points, font family, font size, and colour picker)
+   pinned at the top of the screen while scrolling down through long notes */
 .editor-tools {
+  position: sticky;
+  top: 0;
+  z-index: 95;
+  background-color: var(--bg-body);
+  padding: 10px 0;
+  border-bottom: 1px solid var(--border-subtle);
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 12px;
   flex-wrap: wrap;
+  transition: background-color 0.25s ease, border-color 0.25s ease, box-shadow 0.2s ease;
+}
+
+/* Subtle bottom elevation shadow applied when the sticky toolbar is actively pinned while scrolling */
+.editor-tools.is-pinned {
+  border-bottom-color: var(--border-color);
+  box-shadow: 0 6px 14px -6px rgba(0, 0, 0, 0.12);
+}
+
+[data-theme="dark"] .editor-tools.is-pinned {
+  box-shadow: 0 6px 14px -6px rgba(0, 0, 0, 0.45);
 }
 
 .toolbar-left {
@@ -1578,12 +1597,14 @@ input:checked+.slider:before {
     padding-bottom: 6px;
   }
 
-  /* Editor toolbar and dropdowns on mobile */
+  /* Sticky editor toolbar and dropdowns on mobile with safe-area top clearance */
   .editor-tools {
     flex-direction: column;
     align-items: flex-start;
     gap: 10px;
     width: 100%;
+    padding-top: max(8px, env(safe-area-inset-top));
+    padding-bottom: 8px;
   }
 
   .toolbar-left {
@@ -1805,13 +1826,14 @@ input:checked+.slider:before {
     padding-bottom: 4px;
   }
 
-  /* Horizontal toolbar in landscape */
+  /* Sticky horizontal toolbar in mobile landscape */
   .editor-tools {
     flex-direction: row;
     align-items: center;
     justify-content: space-between;
     gap: 8px;
     flex-wrap: wrap;
+    padding: 6px 0;
   }
 
   .toolbar-left {
