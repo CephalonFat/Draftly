@@ -139,10 +139,17 @@ try {
 }
 let activeSection = 'General';
 
-// Prefix applied to clan room codes to prevent ID collisions on public PeerJS relay
+// ─────────────────────────────────────────────────────────────────────────────
+// PEER-TO-PEER (P2P) COLLABORATION STATE & PRIVACY PARTITION
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Unique namespace prefix prepended to room codes (e.g. 'draftly-clan-ABC123').
+// This prevents room code collisions with other applications utilizing public PeerJS signaling brokers.
 const PEER_ROOM_PREFIX = 'draftly-clan-';
 
-// Active Clan membership profile loaded from browser local storage
+// Active group/clan membership profile retrieved from browser localStorage.
+// Format: { code: 'ABC123', name: 'Shared Notes', role: 'creator'|'member', joinedAt: '...' }
+// When activeClan is null, the user is in standalone offline mode (personal notes only).
 let activeClan = null;
 try {
     activeClan = JSON.parse(safeStorageGet('draftly-clan', 'null'));
@@ -150,18 +157,36 @@ try {
     activeClan = null;
 }
 
-// PeerJS network and connection state tracking
+// Global PeerJS instance handle representing this client on the WebRTC network
 let peerInstance = null;
+
+// Array of active DataConnection objects representing direct WebRTC channels to connected peers
 let activeConnections = [];
+
+// Re-entrance lock flag: set to true while applying remote updates to prevent locally
+// triggering input/save event listeners that would echo the same payload back to peers
 let isApplyingRemoteUpdate = false;
+
+// Timer handle for background retry attempts if connection or host election fails
 let clanReconnectTimer = null;
+
+// Designates whether this client is serving as the primary room host anchor.
+// The host client is responsible for accepting inbound connections from new joiners
+// and relaying updates across peers in multi-user mesh topologies.
 let isHostingClan = false;
 
 /**
- * Checks if a given note belongs to the active shared clan section.
- * Notes outside the clan section are considered private personal notes.
- * @param {Object} note - The note object to check.
- * @returns {boolean} True if the note is a clan shared note.
+ * Privacy Partition Filter:
+ * Determines whether a specific note is public to the shared group or strictly private.
+ *
+ * HOW PRIVACY WORKS:
+ * - Only notes filed directly under the active group's section name (e.g., "Shared Notes")
+ *   are ever broadcast or synchronized across the peer connection.
+ * - All other notes (e.g. in "General" or custom user sections) are strictly local.
+ *   They remain stored exclusively in the user's browser localStorage and are never sent over the wire.
+ *
+ * @param {Object} note - The note object to evaluate.
+ * @returns {boolean} True if the note belongs to the shared group folder; false if strictly private.
  */
 function isClanNote(note) {
     if (!activeClan || !note) return false;
@@ -300,13 +325,77 @@ const fontSizeNamesMap = {
 };
 
 // ─────────────────────────────────────────
-// INLINE PER-CHARACTER / SELECTION FORMATTING
+// INLINE PER-CHARACTER / SELECTION FORMATTING & STICKY TOOLBAR SUPPORT
 // ─────────────────────────────────────────
 
-function applyInlineStyle(styleProp, value) {
+// Tracks the user's most recent text selection or cursor position inside #note-body
+// so clicking sticky toolbar controls while scrolled down a long note preserves selection.
+let lastEditorSelectionRange = null;
+
+/**
+ * Saves the current selection range if it resides within the #note-body editor.
+ * Ensures that opening toolbar dropdowns or clicking formatting buttons lower down
+ * a long note never loses the highlighted text range.
+ */
+function saveEditorSelection() {
     const editor = document.getElementById('note-body');
     if (!editor) return;
-    editor.focus();
+
+    const selection = window.getSelection();
+    if (!selection || selection.rangeCount === 0) return;
+
+    const range = selection.getRangeAt(0);
+    if (editor.contains(range.commonAncestorContainer)) {
+        lastEditorSelectionRange = range.cloneRange();
+    }
+}
+
+/**
+ * Focuses the #note-body editor without scrolling the page and restores the last saved
+ * selection range if focus had moved away to a toolbar button or dropdown menu.
+ *
+ * @returns {HTMLElement|null} The #note-body element if present, otherwise null.
+ */
+function focusEditorPreservingScrollAndSelection() {
+    const editor = document.getElementById('note-body');
+    if (!editor) return null;
+
+    // Prevent the browser from jumping scroll position back to the top of #note-body
+    editor.focus({ preventScroll: true });
+
+    const selection = window.getSelection();
+    if (!selection) return editor;
+
+    // Check whether the active selection is still inside the note editor
+    let hasSelectionInEditor = false;
+    if (selection.rangeCount > 0) {
+        const currentRange = selection.getRangeAt(0);
+        hasSelectionInEditor = editor.contains(currentRange.commonAncestorContainer);
+    }
+
+    // Restore the saved selection range if clicking a toolbar control cleared or moved it
+    if (!hasSelectionInEditor && lastEditorSelectionRange) {
+        try {
+            selection.removeAllRanges();
+            selection.addRange(lastEditorSelectionRange);
+        } catch (e) {
+            // Ignore stale range errors if DOM nodes were replaced
+        }
+    }
+
+    return editor;
+}
+
+/**
+ * Applies an inline style (color, fontFamily, or fontSize) to the current selection
+ * or cursor position inside #note-body without altering the user's scroll position.
+ *
+ * @param {string} styleProp - The style property identifier ('color', 'fontFamily', or 'fontSize').
+ * @param {string} value - The CSS value to apply to the selection.
+ */
+function applyInlineStyle(styleProp, value) {
+    const editor = focusEditorPreservingScrollAndSelection();
+    if (!editor) return;
 
     const selection = window.getSelection();
     if (!selection || !selection.rangeCount) return;
@@ -345,6 +434,8 @@ function applyInlineStyle(styleProp, value) {
         }
     }
 
+    // Update saved selection after applying inline formatting
+    saveEditorSelection();
     scheduleAutoSave();
 }
 
@@ -367,6 +458,7 @@ function changeFontSize(sizeValue) {
 }
 
 function toggleFontMenu() {
+    saveEditorSelection();
     const fontMenu = document.getElementById('font-menu');
     const bulletMenu = document.getElementById('bullet-menu');
     const fontSizeMenu = document.getElementById('font-size-menu');
@@ -376,6 +468,7 @@ function toggleFontMenu() {
 }
 
 function toggleFontSizeMenu() {
+    saveEditorSelection();
     const fontSizeMenu = document.getElementById('font-size-menu');
     const bulletMenu = document.getElementById('bullet-menu');
     const fontMenu = document.getElementById('font-menu');
@@ -409,13 +502,19 @@ function changeColour(colourValue) {
     if (activeNoteIndex !== null) saveNote();
 }
 
-// BULLET POINTS
+/**
+ * Toggles an unordered bulleted list at the current cursor or selection inside #note-body
+ * while preserving the current scroll position on long notes.
+ */
 function toggleBullets() {
+    focusEditorPreservingScrollAndSelection();
     document.execCommand('insertUnorderedList', false, null);
+    saveEditorSelection();
     if (activeNoteIndex !== null) saveNote();
 }
 
 function toggleBulletMenu() {
+    saveEditorSelection();
     const menu = document.getElementById('bullet-menu');
     const fontMenu = document.getElementById('font-menu');
     const fontSizeMenu = document.getElementById('font-size-menu');
@@ -424,8 +523,16 @@ function toggleBulletMenu() {
     if (menu) menu.classList.toggle('open');
 }
 
+/**
+ * Applies the selected bullet style at the current cursor or selection inside #note-body
+ * without scrolling the editor back to the top of the page.
+ *
+ * @param {string} style - The chosen bullet prefix string.
+ */
 function setBulletStyle(style) {
+    focusEditorPreservingScrollAndSelection();
     document.execCommand('insertUnorderedList', false, null);
+    saveEditorSelection();
     document.getElementById('bullet-menu').classList.remove('open');
     if (activeNoteIndex !== null) saveNote();
 }
@@ -442,6 +549,11 @@ function renderColourButtons() {
         if (colour === currentColour) {
             button.classList.add("active");
         }
+        // Prevent mousedown from stealing focus from #note-body when scrolled down a long note
+        button.onmousedown = function(e) {
+            e.preventDefault();
+            saveEditorSelection();
+        };
         button.onclick = function() { changeColour(colour); };
         container.appendChild(button);
     });
@@ -549,7 +661,13 @@ function saveNote() {
     safeStorageSet('my-notes', JSON.stringify(notes));
     renderNotes();
 
-    // Broadcast saved note only if it belongs to the active shared clan section
+    // ─────────────────────────────────────────────────────────────────────────
+    // P2P SYNC: PERSISTED NOTE BROADCAST
+    // ─────────────────────────────────────────────────────────────────────────
+    // When a note is saved, we broadcast NOTE_SAVED to all connected peers if:
+    // 1. We are NOT currently applying a remote incoming update (prevents infinite echo loops)
+    // 2. We have at least one active peer connection open
+    // 3. The note is in the shared clan section (enforces personal note privacy)
     if (!isApplyingRemoteUpdate && typeof activeConnections !== 'undefined' && activeConnections.length > 0 && typeof isClanNote === 'function' && isClanNote(noteToSave)) {
         broadcastCollabMessage({
             type: 'NOTE_SAVED',
@@ -559,6 +677,12 @@ function saveNote() {
     }
 }
 
+/**
+ * Debounced Auto-Save Scheduler:
+ * Waits 800 milliseconds after the user stops typing before committing note changes
+ * to localStorage and broadcasting a NOTE_SAVED message to peers.
+ * This prevents thrashing storage writes and excessive network traffic on every keystroke.
+ */
 function scheduleAutoSave() {
     if (isLoadingNote) return;
     clearTimeout(saveTimeout);
@@ -575,8 +699,14 @@ function scheduleAutoSave() {
  
 /**
   * Handles live text input in the note editor.
-  * Initializes new shared notes immediately so live edits stream to peers from the first keystroke.
-  * Triggers auto-save timer and broadcasts real-time keystroke updates to connected clan members.
+  *
+  * HOW REAL-TIME SHARING WORKS WHILE TYPING:
+  * 1. Immediate Note Initialization: If typing in a new note inside the shared folder,
+  *    we immediately run saveNote() to assign a persistent ID and insert it into the array.
+  * 2. Auto-Save Debouncing: scheduleAutoSave() schedules the persistent write for 800ms later.
+  * 3. Live Keystroke Streaming: If editing a shared note and connected to peers, we immediately
+  *    broadcast a lightweight NOTE_EDIT_LIVE payload. Connected collaborators see each character
+  *    appear on their screen in real time with near-zero latency, without waiting for auto-save.
   */
 function onEditorInput() {
     // If typing in a new note inside the active shared section, initialize immediately
@@ -587,7 +717,8 @@ function onEditorInput() {
 
     scheduleAutoSave();
 
-    // Broadcast live typing only if editing a note inside the active shared clan section
+    // Broadcast live typing only if editing a note inside the active shared clan section.
+    // The isApplyingRemoteUpdate check prevents echoing changes back to the peer who sent them.
     if (!isApplyingRemoteUpdate && typeof activeConnections !== 'undefined' && activeConnections.length > 0 && activeNoteIndex !== null) {
         const currentNote = notes[activeNoteIndex];
         if (typeof isClanNote === 'function' && isClanNote(currentNote)) {
@@ -805,17 +936,23 @@ function handleSectionDrop(event, sectionName) {
         localStorage.setItem('collapsed-sections', JSON.stringify(collapsedSections));
         renderNotes();
 
-        // Broadcast relocation if moving into or out of the clan section
+        // ─────────────────────────────────────────────────────────────────────
+        // P2P PRIVACY TRANSITION ON DRAG-AND-DROP
+        // ─────────────────────────────────────────────────────────────────────
+        // If the note crosses the boundary between private and shared folders:
+        // 1. Moving INTO the shared group folder: Publish the note to peers via NOTE_SAVED.
+        // 2. Moving OUT of the shared group folder into a personal folder: Remove the note
+        //    from collaborators' screens via NOTE_DELETED while keeping it private on this device.
         if (!isApplyingRemoteUpdate && typeof activeConnections !== 'undefined' && activeConnections.length > 0 && typeof activeClan !== 'undefined' && activeClan) {
             if (sectionName === activeClan.name) {
-                // Moved into clan: share note with clan
+                // Moved into shared group: publish note to all connected collaborators
                 broadcastCollabMessage({
                     type: 'NOTE_SAVED',
                     clanCode: activeClan.code,
                     note: notes[noteIndex]
                 });
             } else if (oldSection === activeClan.name) {
-                // Moved out of clan into personal: remove from other clan members
+                // Moved out of shared group into a private folder: remove from peers
                 broadcastCollabMessage({
                     type: 'NOTE_DELETED',
                     clanCode: activeClan.code,
@@ -1006,7 +1143,11 @@ function deleteNote(index) {
 
     renderNotes();
 
-    // Broadcast note deletion only if it was an active clan shared note
+    // ─────────────────────────────────────────────────────────────────────────
+    // P2P SYNC: NOTE DELETION BROADCAST
+    // ─────────────────────────────────────────────────────────────────────────
+    // Only broadcast NOTE_DELETED if the removed note belonged to the active shared folder.
+    // Deleting personal notes in private sections never broadcasts over the peer network.
     if (!isApplyingRemoteUpdate && typeof activeConnections !== 'undefined' && activeConnections.length > 0 && isClan && typeof activeClan !== 'undefined' && activeClan) {
         broadcastCollabMessage({
             type: 'NOTE_DELETED',
@@ -1285,9 +1426,12 @@ let pendingModalColor = '#37352f';
 let savedSelectionRange = null;
 
 function openColorPickerModal() {
+    const editor = document.getElementById('note-body');
     const selection = window.getSelection();
-    if (selection && selection.rangeCount > 0) {
+    if (selection && selection.rangeCount > 0 && editor && editor.contains(selection.getRangeAt(0).commonAncestorContainer)) {
         savedSelectionRange = selection.getRangeAt(0).cloneRange();
+    } else if (lastEditorSelectionRange) {
+        savedSelectionRange = lastEditorSelectionRange.cloneRange();
     } else {
         savedSelectionRange = null;
     }
@@ -1332,14 +1476,20 @@ function updateModalColorUI(colorHex, updateHexText = true) {
 }
 
 function applyModalColor() {
+    closeColorPickerModal();
+
     if (savedSelectionRange) {
+        lastEditorSelectionRange = savedSelectionRange.cloneRange();
+        const editor = document.getElementById('note-body');
+        if (editor) editor.focus({ preventScroll: true });
         const selection = window.getSelection();
-        selection.removeAllRanges();
-        selection.addRange(savedSelectionRange);
+        if (selection) {
+            selection.removeAllRanges();
+            selection.addRange(savedSelectionRange);
+        }
     }
 
     changeColour(pendingModalColor);
-    closeColorPickerModal();
 }
 
 /**
@@ -1428,13 +1578,106 @@ if (collabModal) {
     });
 }
 
-// ─────────────────────────────────────────
-// PERSISTENT CLAN & SHARED NOTES (PEERJS)
-// ─────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// STICKY FORMATTING TOOLBAR & SELECTION PRESERVATION LISTENERS
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Track cursor and highlighted text changes inside #note-body so clicking sticky
+// toolbar buttons lower down a long note always formats the intended text range.
+const noteBodyEditorEl = document.getElementById('note-body');
+if (noteBodyEditorEl) {
+    noteBodyEditorEl.addEventListener('keyup', saveEditorSelection);
+    noteBodyEditorEl.addEventListener('mouseup', saveEditorSelection);
+    noteBodyEditorEl.addEventListener('touchend', saveEditorSelection, { passive: true });
+}
+document.addEventListener('selectionchange', saveEditorSelection);
+
+// Prevent toolbar button mousedown events from stealing focus away from #note-body
+// or collapsing the active text highlight when scrolled down a long note.
+const editorToolsBar = document.querySelector('.editor-tools');
+if (editorToolsBar) {
+    editorToolsBar.addEventListener('mousedown', function(e) {
+        if (e.target && e.target.closest('button')) {
+            saveEditorSelection();
+            e.preventDefault();
+        }
+    });
+}
+
+/**
+ * Updates the visual pinned state (.is-pinned) on the sticky formatting toolbar (.editor-tools)
+ * whenever the user scrolls down past the note header and title input.
+ * Adds a subtle elevation shadow while the toolbar is actively docked at the top of the screen.
+ */
+function updateStickyToolbarState() {
+    const toolbar = document.querySelector('.editor-tools');
+    const mainScroll = document.querySelector('.main-content');
+    if (!toolbar || !mainScroll) return;
+
+    const mainRect = mainScroll.getBoundingClientRect();
+    const toolbarRect = toolbar.getBoundingClientRect();
+
+    // The toolbar is actively stuck when the scroll container has scrolled down
+    // and the toolbar's top edge meets the top edge of the scroll container
+    const isScrolled = mainScroll.scrollTop > 10 || window.scrollY > 10;
+    const isAtTopEdge = Math.abs(toolbarRect.top - mainRect.top) <= 2 || toolbarRect.top <= 2;
+
+    toolbar.classList.toggle('is-pinned', isScrolled && isAtTopEdge);
+}
+
+const mainScrollContainer = document.querySelector('.main-content');
+if (mainScrollContainer) {
+    mainScrollContainer.addEventListener('scroll', updateStickyToolbarState, { passive: true });
+}
+window.addEventListener('scroll', updateStickyToolbarState, { passive: true });
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ARCHITECTURAL OVERVIEW: SERVERLESS PEER-TO-PEER NOTE SHARING (WEBRTC)
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// 1. Philosophy & Zero-Knowledge Architecture:
+//    - Draftly does not use any central database or cloud backend to store notes.
+//    - All user notes reside safely and permanently in browser localStorage on the user's
+//      device. No remote server ever holds an unencrypted copy of your notebook.
+//    - When users collaborate, data flows directly between browsers using WebRTC
+//      DataChannels with end-to-end peer-to-peer encryption.
+//
+// 2. Discovery & Signaling Relay:
+//    - WebRTC requires an initial "handshake" so two browsers behind NAT firewalls can
+//      discover each other's public/private IP addresses and port candidates.
+//    - We use the public PeerJS signaling broker strictly for this initial handshake.
+//      Once the WebRTC data channel is established, the signaling server is no longer
+//      used; all data, keystrokes, and note edits travel directly device-to-device.
+//
+// 3. Adaptive Host Election & Mesh Topology:
+//    - Groups are identified by a 6-character room code (e.g. 'ABC123').
+//    - The first user to create or connect to the room becomes the Room Host, binding to
+//      the fixed ID 'draftly-clan-<ROOM_CODE>'.
+//    - Additional collaborators connect directly to this Host as Clients.
+//    - The Host acts as a message router/relay: whenever it receives a note edit from one
+//      client, it automatically forwards it to all other connected clients.
+//    - If the Host closes their browser, the remaining clients detect the disconnection and
+//      adaptively elect a new Host, keeping collaboration uninterrupted.
+//
+// 4. Privacy Partitioning:
+//    - Only notes stored inside the active group's section (e.g. "Shared Notes") are synced.
+//    - Personal notes in other folders ("General", custom sections) are never shared.
+//    - When you leave a group, all shared notes remain preserved locally on your device.
+//
+// 5. Real-Time Synchronization Protocol:
+//    - SYNC_CLAN: When two peers connect, they exchange their shared note lists. Dual-key
+//      deduplication (ID + content fingerprint) merges notes without duplicates and converges
+//      both devices on the same canonical note IDs.
+//    - NOTE_EDIT_LIVE: As a user types, every keystroke sends a lightweight edit packet.
+//      Collaborators' screens update live with sub-millisecond latency.
+//    - NOTE_SAVED: An 800ms debounced auto-save writes the note to localStorage and sends
+//      the final persistent version to peers.
+//    - NOTE_DELETED: Propagates note removals instantly across all connected peers.
+// ─────────────────────────────────────────────────────────────────────────────
 
 
 /**
- * Opens the Clan modal dialog and refreshes its view based on current membership.
+ * Opens the Clan/Sharing modal dialog and refreshes its view based on current membership.
  */
 function openCollabModal() {
     const modal = document.getElementById('collab-modal');
@@ -1445,7 +1688,7 @@ function openCollabModal() {
 }
 
 /**
- * Closes the Clan modal dialog.
+ * Closes the Clan/Sharing modal dialog.
  */
 function closeCollabModal() {
     const modal = document.getElementById('collab-modal');
@@ -1457,7 +1700,7 @@ function closeCollabModal() {
 /**
  * Generates an easily readable 6-character room code string.
  * Omits easily confused characters like 0, O, 1, and I for clarity.
- * @returns {string} The randomly generated uppercase room code.
+ * @returns {string} The randomly generated uppercase room code (e.g. '7K9X2B').
  */
 function generateRoomCode() {
     const chars = '23456789ABCDEFGHJKLMNPQRSTUVWXYZ';
@@ -1497,6 +1740,7 @@ function updateCollabStatus(statusText, mode = 'offline') {
 
 /**
  * Updates visible views, clan name fields, and subtexts in the collaboration modal.
+ * Shows the active group dashboard when connected, or the setup/join forms when disconnected.
  */
 function updateCollabModalUI() {
     const dashboardView = document.getElementById('clan-dashboard-view');
@@ -1506,6 +1750,7 @@ function updateCollabModalUI() {
     const subtextEl = document.getElementById('collab-status-subtext');
 
     if (activeClan) {
+        // Group is active: display dashboard with code, invite link, and connected peer count
         if (dashboardView) dashboardView.style.display = 'flex';
         if (setupView) setupView.style.display = 'none';
         if (clanNameEl) clanNameEl.textContent = activeClan.name;
@@ -1517,19 +1762,22 @@ function updateCollabModalUI() {
             if (subtextEl) subtextEl.textContent = 'Connected in background. Notes stay saved locally.';
         }
     } else {
+        // No group: show setup options (Create Group or Enter Code)
         if (dashboardView) dashboardView.style.display = 'none';
         if (setupView) setupView.style.display = 'flex';
     }
 }
 
 /**
- * Handles creating a brand new Clan.
- * Generates a unique room code, sets up the clan section, saves membership, and connects.
+ * Handles creating a brand-new sharing group.
+ * Generates a random 6-character room code, registers the group section in the sidebar,
+ * saves the group profile in localStorage, and starts the background P2P connection.
  */
 function handleCreateClan() {
     const input = document.getElementById('create-clan-input');
     const clanName = input && input.value.trim() ? input.value.trim() : 'Shared Notes';
 
+    // Generate a fresh 6-character room code
     const code = generateRoomCode();
     activeClan = {
         code: code,
@@ -1538,9 +1786,10 @@ function handleCreateClan() {
         joinedAt: new Date().toISOString()
     };
 
+    // Persist group membership so the user stays in the group on future visits
     localStorage.setItem('draftly-clan', JSON.stringify(activeClan));
 
-    // Ensure the clan section exists in sections
+    // Ensure the shared folder section exists in the sidebar
     if (!sections.includes(clanName)) {
         sections.push(clanName);
         localStorage.setItem('my-sections', JSON.stringify(sections));
@@ -1548,6 +1797,7 @@ function handleCreateClan() {
 
     renderNotes();
     updateCollabModalUI();
+    // Connect to the WebRTC network (will elect this device as room host)
     autoConnectClan();
 }
 
@@ -1563,9 +1813,12 @@ function handleJoinFromInput() {
 }
 
 /**
- * Joins a clan by room code and persists membership to localStorage.
- * @param {string} code - The 6-character clan code.
- * @param {string} [name] - Optional clan name.
+ * Joins an existing sharing group using a 6-character room code.
+ * Saves the membership profile to localStorage, ensures the shared folder section
+ * exists in the sidebar, and initiates the background peer connection to the host.
+ *
+ * @param {string} code - The 6-character group room code (e.g. 'ABC123').
+ * @param {string} [name] - Optional display name for the group (defaults to 'Shared Notes').
  */
 function joinClanByCode(code, name) {
     if (!code) return;
@@ -1579,9 +1832,10 @@ function joinClanByCode(code, name) {
         joinedAt: new Date().toISOString()
     };
 
+    // Save membership profile in localStorage so connection persists across browser reloads
     localStorage.setItem('draftly-clan', JSON.stringify(activeClan));
 
-    // Ensure the clan section exists in sections
+    // Ensure the shared folder section exists in the sidebar
     if (!sections.includes(clanName)) {
         sections.push(clanName);
         localStorage.setItem('my-sections', JSON.stringify(sections));
@@ -1589,12 +1843,15 @@ function joinClanByCode(code, name) {
 
     renderNotes();
     updateCollabModalUI();
+    // Connect to the room host over WebRTC
     autoConnectClan();
 }
 
 /**
- * Disconnects from active clan, clears clan profile from localStorage,
- * and resets the UI back to setup mode while preserving local notes.
+ * Gracefully leaves the active sharing group.
+ * Closes all open WebRTC peer connections, destroys the PeerJS instance, removes the group
+ * profile from localStorage, and resets the UI back to setup mode.
+ * NOTE: All notes in the shared section remain intact on this device as private local notes.
  */
 function confirmLeaveClan() {
     if (!activeClan) return;
@@ -1605,12 +1862,13 @@ function confirmLeaveClan() {
 
     if (!confirmed) return;
 
-    // Disconnect peer connections
+    // Disconnect and close all open direct WebRTC peer connections
     activeConnections.forEach(conn => {
         try { conn.close(); } catch (e) {}
     });
     activeConnections = [];
 
+    // Destroy local PeerJS broker instance and unregister ID
     if (peerInstance) {
         try { peerInstance.destroy(); } catch (e) {}
         peerInstance = null;
@@ -1618,7 +1876,7 @@ function confirmLeaveClan() {
 
     clearTimeout(clanReconnectTimer);
 
-    // Remove clan profile from localStorage
+    // Remove group membership from localStorage (reverts user to standalone mode)
     localStorage.removeItem('draftly-clan');
     activeClan = null;
 
@@ -1628,8 +1886,18 @@ function confirmLeaveClan() {
 }
 
 /**
- * Connects to the clan network in the background automatically.
- * Implements adaptive host election: tries connecting as member; if no host exists, becomes room host.
+ * Background P2P Auto-Connection & Adaptive Host Election:
+ *
+ * HOW THE CONNECTION HANDSHAKE WORKS:
+ * 1. Checks if the external PeerJS library loaded properly (guards against offline / ad-blockers).
+ * 2. Generates an ephemeral random peer ID for this device and attempts to connect directly
+ *    to the room's fixed host identifier: 'draftly-clan-' + activeClan.code.
+ * 3. Starts a 6-second connection timeout:
+ *    - If an active room host exists, WebRTC signaling succeeds, conn.on('open') fires,
+ *      the timeout is cancelled, and this device joins as a Client.
+ *    - If no host exists (e.g. this is the first user in the room, or the previous host left),
+ *      the connection fails or times out after 6 seconds. This device then calls becomeClanHost(),
+ *      taking over the fixed room host ID so subsequent joiners can find it.
  */
 function autoConnectClan() {
     if (!activeClan || !activeClan.code) return;
@@ -1641,6 +1909,7 @@ function autoConnectClan() {
         return;
     }
 
+    // Clean up any lingering previous peer instance
     if (peerInstance) {
         try { peerInstance.destroy(); } catch (e) {}
         peerInstance = null;
@@ -1648,18 +1917,22 @@ function autoConnectClan() {
 
     updateCollabStatus(activeClan.name + ': Connecting...', 'hosting');
 
-    // Attempt to connect as client first
+    // Step 1: Attempt to connect as a client to an existing room host
     try {
         peerInstance = new Peer({ debug: 1 });
 
         peerInstance.on('open', () => {
+            // Dial the fixed room host ID on the PeerJS signaling broker
             const conn = peerInstance.connect(PEER_ROOM_PREFIX + activeClan.code, {
                 reliable: true
             });
 
+            // Set up event listeners for data exchange on this connection
             setupPeerConnection(conn);
 
-            // If connection doesn't open within 6 seconds (host not present or slow ICE gathering), elect this device as host
+            // Step 2: Adaptive Host Fallback
+            // If connection doesn't open within 6 seconds (host not present or slow ICE gathering),
+            // assume no host is alive and elect this device as the room host anchor
             const connectionTimeout = setTimeout(() => {
                 if (activeConnections.length === 0) {
                     try {
@@ -1669,11 +1942,13 @@ function autoConnectClan() {
                 }
             }, 6000);
 
+            // If connection opens successfully, cancel the timeout (we are connected to an existing host)
             conn.on('open', () => {
                 clearTimeout(connectionTimeout);
             });
         });
 
+        // If client peer errors out (e.g. signaling broker glitch), attempt becoming host
         peerInstance.on('error', (err) => {
             becomeClanHost();
         });
@@ -1684,7 +1959,14 @@ function autoConnectClan() {
 }
 
 /**
- * Elects this client as the active host anchor for the clan room.
+ * Elects this client as the active Room Host anchor.
+ *
+ * HOW ROOM HOSTING WORKS:
+ * - Creates a Peer instance registered under the fixed, predictable ID:
+ *   'draftly-clan-' + activeClan.code (e.g. 'draftly-clan-ABC123').
+ * - Listens for incoming WebRTC connections from other collaborators via peerInstance.on('connection').
+ * - As the host, this client also acts as a message router: whenever it receives a note update
+ *   from one collaborator, it relays that update to all other connected peers.
  */
 function becomeClanHost() {
     if (!activeClan || !activeClan.code) return;
@@ -1703,6 +1985,7 @@ function becomeClanHost() {
     isHostingClan = true;
 
     try {
+        // Bind to the fixed room host ID on the public PeerJS signaling relay
         peerInstance = new Peer(PEER_ROOM_PREFIX + activeClan.code, { debug: 1 });
 
         peerInstance.on('open', () => {
@@ -1710,13 +1993,14 @@ function becomeClanHost() {
             updateCollabModalUI();
         });
 
+        // Listen for incoming connection requests from collaborators joining this room
         peerInstance.on('connection', (conn) => {
             setupPeerConnection(conn);
         });
 
         peerInstance.on('error', (err) => {
             console.error('Host peer error:', err);
-            // Retry after delay if ID collision or network blip
+            // If an ID collision or temporary broker blip occurs, retry connection after a brief delay
             clearTimeout(clanReconnectTimer);
             clanReconnectTimer = setTimeout(autoConnectClan, 8000);
         });
@@ -1726,9 +2010,18 @@ function becomeClanHost() {
 }
 
 /**
- * Sets up listeners for a peer connection and exchanges initial clan notes snapshot.
- * Transmits ONLY clan notes; personal notes are never shared.
- * @param {DataConnection} conn - The PeerJS data connection.
+ * Configures listeners for a WebRTC DataConnection channel and handles the initial note snapshot.
+ *
+ * HOW CONNECTION LIFECYCLE WORKS:
+ * 1. 'open': Triggered when WebRTC peer-to-peer data channel is fully established.
+ *    - Connection is added to activeConnections array.
+ *    - Transmits an initial SYNC_CLAN snapshot containing ONLY shared notes (enforcing personal privacy).
+ * 2. 'data': Triggered whenever a peer sends a message (live keystroke, note save, or deletion).
+ *    - Routed to handlePeerData(data, conn) for processing and optional host relay.
+ * 3. 'close': Triggered when a peer closes their tab or loses internet connection.
+ *    - Removes connection from activeConnections and updates UI status indicator.
+ *
+ * @param {DataConnection} conn - The PeerJS WebRTC data connection object.
  */
 function setupPeerConnection(conn) {
     conn.on('open', () => {
@@ -1739,7 +2032,9 @@ function setupPeerConnection(conn) {
         updateCollabStatus(activeClan ? activeClan.name + ' (Connected)' : 'Connected', 'connected');
         updateCollabModalUI();
 
-        // Transmit current clan notes snapshot (ONLY clan notes, personal notes excluded)
+        // PRIVACY ENFORCEMENT:
+        // Filter and transmit ONLY notes filed under the shared clan section.
+        // Personal notes in "General" or custom sections are strictly excluded from transmission.
         const clanNotes = notes.filter(n => isClanNote(n));
         conn.send({
             type: 'SYNC_CLAN',
@@ -1769,14 +2064,32 @@ function setupPeerConnection(conn) {
 }
 
 /**
- * Handles incoming real-time synchronization payloads received from peer connections.
- * Merges clan updates without touching any of the user's private personal notes.
- * @param {Object} data - The message payload transmitted by a peer.
+ * Central Peer Data Dispatcher:
+ * Handles incoming real-time synchronization payloads received from peer WebRTC connections.
+ *
+ * HOW MESSAGE HANDLING & DUAL-KEY DEDUPLICATION WORK:
+ * 1. Re-Entrance Protection: isApplyingRemoteUpdate is set to true during processing.
+ *    This ensures that modifying note DOM inputs or calling local helpers does not trigger
+ *    local input events that would echo the received update back across the network.
+ * 2. Multi-Peer Host Relay: If this client is acting as the room host and has multiple peers
+ *    connected, it forwards the incoming payload to all other connected peers (excluding the sender).
+ *    This creates a star-mesh topology where all participants stay in sync without every peer
+ *    needing direct connections to every other peer.
+ * 3. Message Types Handled:
+ *    - 'SYNC_CLAN': Full snapshot merge on initial connection with deterministic ID reconciliation.
+ *    - 'NOTE_EDIT_LIVE': Real-time keystroke streaming while someone is typing.
+ *    - 'NOTE_SAVED': Debounced auto-save committing the final version of an edited note.
+ *    - 'NOTE_DELETED': Removal of a shared note across all peers.
+ *
+ * @param {Object} data - The payload transmitted by a peer over the WebRTC data channel.
+ * @param {DataConnection} [senderConn=null] - The specific peer connection that sent this payload.
  */
 function handlePeerData(data, senderConn = null) {
     if (!data || !data.type || !activeClan) return;
 
-    // Relay to other connected peers if this client is hosting the room (enables multi-device mesh)
+    // Multi-Device Mesh Relay:
+    // If this client is hosting the room, forward the received peer event to all other connected peers
+    // (excluding the original sender) so everyone in the group stays synchronized
     if (isHostingClan && activeConnections.length > 1) {
         activeConnections.forEach(c => {
             if (c && c.open && c !== senderConn) {
@@ -1785,29 +2098,36 @@ function handlePeerData(data, senderConn = null) {
         });
     }
 
+    // Set re-entrance lock to prevent local event listeners from echoing this update back to peers
     isApplyingRemoteUpdate = true;
 
     try {
+        // ─────────────────────────────────────────────────────────────────────
+        // MESSAGE TYPE: SYNC_CLAN (Initial Snapshot Exchange & Note Reconciliation)
+        // ─────────────────────────────────────────────────────────────────────
+        // Fired once when two peers establish a WebRTC data channel.
+        // Merges incoming notes with local notes using dual-key deduplication (ID + content).
         if (data.type === 'SYNC_CLAN') {
-            // Update clan name if sent
+            // Update local clan display name if the peer has a newer or customized name
             if (data.clanName && activeClan.name !== data.clanName) {
                 activeClan.name = data.clanName;
                 safeStorageSet('draftly-clan', JSON.stringify(activeClan));
             }
 
-            // Extract existing personal notes (must remain untouched)
+            // PRIVACY ISOLATION:
+            // Extract existing personal notes (outside the clan section).
+            // These notes must remain completely untouched by the synchronization process.
             const personalNotes = notes.filter(n => !isClanNote(n));
 
-            // Merge incoming clan notes with dual-key deduplication (ID + content)
-            // This handles the case where different devices generated different
-            // unique IDs for the same note during the migration to persistent IDs
+            // Normalize incoming clan notes and ensure every note has a valid ID
             const incomingClanNotes = (data.notes || []).map(n => ({
                 ...n,
                 id: n.id || generateNoteId(),
                 section: activeClan.name
             }));
 
-            // Helper: content fingerprint for identifying identical notes across devices
+            // Content fingerprint helper for detecting identical notes across devices
+            // even if different devices assigned different random IDs during migration
             function clanContentKey(n) {
                 return (n.title || '').trim() + ':::' + (n.body || '').trim();
             }
@@ -1816,29 +2136,28 @@ function handlePeerData(data, senderConn = null) {
             const seenIds = new Set();
             const seenContent = new Set();
 
-            // First pass: add all incoming notes from peer and track both IDs and content
+            // First pass: register all incoming notes from the peer
             incomingClanNotes.forEach(n => {
                 if (n.id) seenIds.add(n.id);
                 seenContent.add(clanContentKey(n));
                 mergedClanNotes.push(n);
             });
 
-            // Second pass: add local clan notes that are genuinely different from incoming
-            // Uses content-based matching as fallback when IDs differ across devices
+            // Second pass: merge local clan notes that are genuinely unique
             notes.filter(n => isClanNote(n)).forEach(localNote => {
                 const matchedById = localNote.id && seenIds.has(localNote.id);
                 const localCk = clanContentKey(localNote);
                 const matchedByContent = seenContent.has(localCk);
 
                 if (!matchedById && !matchedByContent) {
-                    // Genuinely unique local note not present in peer sync
+                    // Truly unique local note not present in peer's notebook: retain it
                     if (localNote.id) seenIds.add(localNote.id);
                     seenContent.add(localCk);
                     mergedClanNotes.push(localNote);
                 } else if (matchedByContent && !matchedById && localNote.id) {
-                    // Same content exists from peer but with a different ID
-                    // Use deterministic tiebreaker (smaller ID wins) so both devices
-                    // converge to the same canonical ID regardless of sync order
+                    // Same note content exists from peer but under a different ID.
+                    // Deterministic tiebreaker: the lexicographically smaller ID wins.
+                    // This guarantees that both devices converge to the exact same ID regardless of who connected first.
                     const peerNote = mergedClanNotes.find(n => clanContentKey(n) === localCk);
                     if (peerNote && localNote.id < peerNote.id) {
                         peerNote.id = localNote.id;
@@ -1846,16 +2165,16 @@ function handlePeerData(data, senderConn = null) {
                 }
             });
 
-            // Preserve reference to currently opened note across array rebuild
+            // Capture the identity of the currently open note so array rebuilding doesn't lose the editor position
             const currentActiveNote = (activeNoteIndex !== null && notes[activeNoteIndex]) ? notes[activeNoteIndex] : null;
             const currentActiveId = currentActiveNote ? currentActiveNote.id : null;
             const currentActiveDate = currentActiveNote ? currentActiveNote.date : null;
 
-            // Combine into unified notebook
+            // Combine reconciled shared notes with untouched private personal notes
             notes = [...mergedClanNotes, ...personalNotes];
             safeStorageSet('my-notes', JSON.stringify(notes));
 
-            // Remap active note index in new notes array
+            // Remap active note index in new notes array to prevent editor disconnection
             if (currentActiveNote) {
                 const remappedIndex = notes.findIndex(n => 
                     (currentActiveId && n.id === currentActiveId) || 
@@ -1864,7 +2183,7 @@ function handlePeerData(data, senderConn = null) {
                 activeNoteIndex = remappedIndex !== -1 ? remappedIndex : null;
             }
 
-            // Ensure clan section exists
+            // Ensure the shared folder section exists in the sidebar sections list
             if (!sections.includes(activeClan.name)) {
                 sections.push(activeClan.name);
                 safeStorageSet('my-sections', JSON.stringify(sections));
@@ -1872,16 +2191,23 @@ function handlePeerData(data, senderConn = null) {
 
             renderNotes();
             updateCollabModalUI();
+
+        // ─────────────────────────────────────────────────────────────────────
+        // MESSAGE TYPE: NOTE_EDIT_LIVE (Real-Time Keystroke Streaming)
+        // ─────────────────────────────────────────────────────────────────────
+        // Fired on every keystroke as a collaborator types in a shared note.
+        // Updates the note in memory, and if currently viewing that note, updates the editor DOM live.
         } else if (data.type === 'NOTE_EDIT_LIVE') {
-            // Live typing update: match by persistent ID first, then date fallback
+            // Three-Stage Fallback Search:
+            // 1. Try matching by persistent unique note ID
             let targetNote = notes.find(n => isClanNote(n) && data.id && n.id === data.id);
 
-            // Date-based fallback if ID match fails (handles cross-device ID mismatch)
+            // 2. Fallback: match by creation timestamp if IDs differ
             if (!targetNote && data.date) {
                 targetNote = notes.find(n => isClanNote(n) && n.date === data.date);
             }
 
-            // Content-based fallback if both ID and date fail
+            // 3. Fallback: match by title and body content fingerprint
             if (!targetNote) {
                 const incomingCk = (data.title || '').trim() + ':::' + (data.body || '').trim();
                 if (incomingCk !== ':::') {
@@ -1889,7 +2215,9 @@ function handlePeerData(data, senderConn = null) {
                 }
             }
 
-            // If note does not exist on this client yet, create it dynamically so typing streams immediately
+            // Dynamic Instantiation:
+            // If the note doesn't exist on this device yet (e.g. peer just created it and started typing),
+            // instantiate it immediately in the shared section so typing appears live
             if (!targetNote) {
                 targetNote = {
                     id: data.id || generateNoteId(),
@@ -1910,13 +2238,14 @@ function handlePeerData(data, senderConn = null) {
                 targetNote.title = data.title;
                 targetNote.body = data.body;
 
-                // Reconcile IDs so future lookups use the exact same ID across devices
+                // Reconcile ID to sender's ID so subsequent lookups succeed via stage 1
                 if (data.id && targetNote.id !== data.id) {
                     targetNote.id = data.id;
                     safeStorageSet('my-notes', JSON.stringify(notes));
                 }
             }
 
+            // Live Editor DOM Update:
             // Check if user is currently viewing this note in the active editor
             const isViewingThisNote = activeNoteIndex !== null && notes[activeNoteIndex] && (
                 notes[activeNoteIndex] === targetNote ||
@@ -1925,7 +2254,7 @@ function handlePeerData(data, senderConn = null) {
             );
 
             if (isViewingThisNote) {
-                // Keep activeNoteIndex aligned with targetNote's position in notes array
+                // Ensure activeNoteIndex tracks targetNote's position in notes array
                 activeNoteIndex = notes.indexOf(targetNote);
 
                 const titleEl = document.getElementById('note-title');
@@ -1938,8 +2267,13 @@ function handlePeerData(data, senderConn = null) {
                 }
             }
             renderNotes();
+
+        // ─────────────────────────────────────────────────────────────────────
+        // MESSAGE TYPE: NOTE_SAVED (Persistent Note Save)
+        // ─────────────────────────────────────────────────────────────────────
+        // Fired after the 800ms auto-save debounce triggers on a peer's device.
+        // Updates the existing note in-place without creating duplicate copies.
         } else if (data.type === 'NOTE_SAVED') {
-            // Saved clan note
             if (data.note) {
                 const incomingNote = {
                     ...data.note,
@@ -1947,15 +2281,16 @@ function handlePeerData(data, senderConn = null) {
                     section: activeClan.name
                 };
 
-                // Match by unique persistent ID first
+                // Three-Stage Fallback Search:
+                // 1. Match by persistent unique note ID
                 let existingIndex = notes.findIndex(n => isClanNote(n) && incomingNote.id && n.id === incomingNote.id);
 
-                // Date-based fallback if ID match fails
+                // 2. Fallback: match by creation timestamp
                 if (existingIndex === -1 && incomingNote.date) {
                     existingIndex = notes.findIndex(n => isClanNote(n) && n.date === incomingNote.date);
                 }
 
-                // Content-based fallback if both ID and date fail
+                // 3. Fallback: match by content fingerprint
                 if (existingIndex === -1) {
                     const incomingCk = (incomingNote.title || '').trim() + ':::' + (incomingNote.body || '').trim();
                     if (incomingCk !== ':::') {
@@ -1964,7 +2299,7 @@ function handlePeerData(data, senderConn = null) {
                 }
 
                 if (existingIndex !== -1) {
-                    // Update note in-place without creating duplicate copies
+                    // Note found: update in-place without duplicating
                     notes[existingIndex] = {
                         ...notes[existingIndex],
                         ...incomingNote,
@@ -1992,7 +2327,7 @@ function handlePeerData(data, senderConn = null) {
                         }
                     }
                 } else {
-                    // Genuine new note created by peer
+                    // Genuine new note created by peer: insert at top of notebook
                     notes.unshift(incomingNote);
                     if (activeNoteIndex !== null) {
                         activeNoteIndex++;
@@ -2002,6 +2337,11 @@ function handlePeerData(data, senderConn = null) {
                 safeStorageSet('my-notes', JSON.stringify(notes));
                 renderNotes();
             }
+
+        // ─────────────────────────────────────────────────────────────────────
+        // MESSAGE TYPE: NOTE_DELETED (Note Removal)
+        // ─────────────────────────────────────────────────────────────────────
+        // Fired when a peer deletes a shared note or moves it out of the shared folder.
         } else if (data.type === 'NOTE_DELETED') {
             // Match note to remove by persistent ID first, then fallback to date
             let deleteIndex = notes.findIndex(n => isClanNote(n) && data.id && n.id === data.id);
@@ -2012,6 +2352,8 @@ function handlePeerData(data, senderConn = null) {
             if (deleteIndex !== -1) {
                 notes.splice(deleteIndex, 1);
                 safeStorageSet('my-notes', JSON.stringify(notes));
+
+                // If currently editing the deleted note, clear the editor
                 if (activeNoteIndex === deleteIndex) {
                     activeNoteIndex = null;
                     document.getElementById('note-title').value = '';
@@ -2023,13 +2365,16 @@ function handlePeerData(data, senderConn = null) {
             }
         }
     } finally {
+        // Release re-entrance lock once incoming remote update is fully processed
         isApplyingRemoteUpdate = false;
     }
 }
 
 /**
- * Broadcasts an event payload to all open active peer connections in the clan.
- * @param {Object} message - The payload object to transmit.
+ * Broadcasts an event payload to all open active WebRTC peer connections.
+ * Iterates through activeConnections and transmits the message JSON.
+ *
+ * @param {Object} message - The payload object to transmit (e.g. NOTE_EDIT_LIVE, NOTE_SAVED).
  */
 function broadcastCollabMessage(message) {
     activeConnections.forEach(conn => {
@@ -2044,7 +2389,8 @@ function broadcastCollabMessage(message) {
 }
 
 /**
- * Copies the full URL with the active clan code parameter to clipboard for 1-click joining.
+ * Copies the 1-click invite link with the active room code parameter to clipboard.
+ * URL format: https://<domain>?clan=<ROOM_CODE>
  */
 function copyCollabLink() {
     if (!activeClan || !activeClan.code) return;
@@ -2066,7 +2412,11 @@ function copyCollabLink() {
     });
 }
 
-// Check for persistent Clan membership on page launch and auto-connect
+// ─────────────────────────────────────────────────────────────────────────────
+// STARTUP INITIALIZATION: AUTO-CONNECT & 1-CLICK URL INVITES
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Check for persistent Clan membership on page launch and automatically connect in the background
 if (activeClan && activeClan.code) {
     updateCollabStatus(activeClan.name + ': Connecting...', 'hosting');
     setTimeout(autoConnectClan, 300);
@@ -2075,7 +2425,8 @@ if (activeClan && activeClan.code) {
 }
 updateCollabModalUI();
 
-// Check URL query parameters for ?clan=CODE or legacy ?room=CODE
+// Check URL query parameters for ?clan=CODE or legacy ?room=CODE (1-click invite links)
+// If a user opens an invite link, automatically open the modal and join the group
 const urlParams = new URLSearchParams(window.location.search);
 const sharedClanParam = urlParams.get('clan') || urlParams.get('room');
 if (sharedClanParam && (!activeClan || activeClan.code !== sharedClanParam)) {
